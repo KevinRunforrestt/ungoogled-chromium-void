@@ -52,6 +52,23 @@ jobs:
         run: |
           cp -r master/void-packages ./ 2>/dev/null
 
+      - name: Update checksums automatically
+        if: steps.ci_skip_check.outputs.skip_ci == 'false'
+        run: |
+          # Asegurar que xtools está instalado en el runner
+          if ! command -v xgensum >/dev/null 2>&1; then
+            echo "Installing xtools..."
+            sudo xbps-install -y xtools || xbps-install -y xtools
+          fi
+          
+          cd void-packages
+          echo "Generating checksums for ungoogled-chromium..."
+          # xgensum descargará las fuentes, calculará el SHA256 y actualizará el template
+          xgensum -f ungoogled-chromium
+          
+          echo "Checksums actualizados en el template:"
+          grep -A 3 '^checksum=' srcpkgs/ungoogled-chromium/template
+
       - id: version
         if: steps.ci_skip_check.outputs.skip_ci == 'false'
         run: |
