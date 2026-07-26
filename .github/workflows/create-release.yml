@@ -110,11 +110,15 @@ jobs:
           #   x86_64       = native glibc build (container is glibc/amd64)
           #   x86_64-musl  = cross build: glibc host compiles musl target via
           #                  the musl bootstrap tarball from
-          #                  repo-default.voidlinux.org/current/musl
+          #                  repo-fastly.voidlinux.org/current/musl
           - arch: x86_64
             description: "glibc"
+            # glibc repo lives at the root of /current/
+            repo: "https://repo-fastly.voidlinux.org/current/"
           - arch: x86_64-musl
             description: "musl"
+            # musl repo lives under /current/musl/
+            repo: "https://repo-fastly.voidlinux.org/current/musl/"
     # ubuntu-22.04 is what repo-neko uses and is known to work with
     # `container: image: ghcr.io/void-linux/void-mklive:...` + --privileged.
     runs-on: ubuntu-22.04
@@ -126,16 +130,56 @@ jobs:
       XBPS_TARGET_ARCH: ${{ matrix.arch }}
       PKG_VER: ${{ needs.Fetch.outputs.ver }}
       PKG_REV: ${{ needs.Fetch.outputs.rev }}
+      # The default mirror baked into the image (alpha.de.repo.voidlinux.org)
+      # has an expired / mismatched TLS cert and the host no longer exists.
+      # Force the Fastly CDN mirror for every xbps-install call below.
+      XBPS_REPO: ${{ matrix.repo }}
     steps:
-      - name: Fix SSL and install tools
-        # Mirror repo-neko's bootstrap exactly: --repository bypasses the
-        # image's default mirror config (which may point to a stale mirror)
-        # and forces repo-de.voidlinux.org/current/, the canonical EU mirror.
-        # Two-step: update xbps first, then the rest of the system.
+      - name: Force Fastly CDN mirror and install tools
+        # ============================================================
+        # CRITICAL — do this BEFORE any xbps-install call.
+        # ============================================================
+        # The container image ships /etc/xbps.d/*.conf pointing at
+        # alpha.de.repo.voidlinux.org, which has (a) expired/mismatched
+        # TLS certs and (b) the host no longer exists. Even when we pass
+        # --repository=... explicitly, xbps-install still ALSO reads the
+        # /etc/xbps.d fragments and tries to sync those repos, producing
+        # the "SSL certificate subject doesn't match host" errors.
+        #
+        # Fix: wipe every xbps.d fragment and write a single one pointing
+        # at the Fastly CDN mirror. This affects EVERY xbps-* command in
+        # this job (xbps-install, xbps-query, xbps-rindex, AND the ones
+        # xbps-src invokes internally later).
+        env:
+          XBPS_REPO: ${{ matrix.repo }}
         run: |
-          xbps-install -Syu --repository=https://repo-de.voidlinux.org/current/ xbps
-          xbps-install -Suyd --repository=https://repo-de.voidlinux.org/current/
-          xbps-install -y --repository=https://repo-de.voidlinux.org/current/ \
+          echo "Target arch:    ${XBPS_TARGET_ARCH}"
+          echo "Using XBPS repo: ${XBPS_REPO}"
+
+          rm -f /etc/xbps.d/*.conf
+          mkdir -p /etc/xbps.d
+          if [ "${XBPS_TARGET_ARCH}" = "x86_64-musl" ]; then
+            # For musl cross-builds we need BOTH the glibc repo (host
+            # side) AND the musl repo (target side).
+            cat > /etc/xbps.d/00-repository-main.conf <<'EOF'
+          repository=https://repo-fastly.voidlinux.org/current/
+          repository=https://repo-fastly.voidlinux.org/current/musl/
+          EOF
+          else
+            cat > /etc/xbps.d/00-repository-main.conf <<'EOF'
+          repository=https://repo-fastly.voidlinux.org/current/
+          EOF
+          fi
+
+          echo "=== /etc/xbps.d/00-repository-main.conf ==="
+          cat /etc/xbps.d/00-repository-main.conf
+
+          # Now xbps-install will read the Fastly mirror. Two-step update:
+          # upgrade xbps itself first (so it can handle current repo
+          # signatures), then the rest of the system, then runtime deps.
+          xbps-install -Syu xbps
+          xbps-install -Suyd
+          xbps-install -y \
             base-chroot base-devel git curl ca-certificates \
             python3 bash sudo xtools openssl tar xz
 
@@ -165,6 +209,19 @@ jobs:
           cp -r "${WS}/repo/void-packages/srcpkgs/ungoogled-chromium"    srcpkgs/
           cp -r "${WS}/repo/void-packages/srcpkgs/ungoogled-chromium-qt6" srcpkgs/
 
+          # Append XBPS_DISTFILES_MIRROR to void-packages/etc/conf so
+          # xbps-src's fetch step downloads distfiles from Fastly too.
+          # (Binary repos are already configured via /etc/xbps.d/ in the
+          # previous step.)
+          cat >> etc/conf <<EOF
+
+          # Added by create-release.yml — force Fastly CDN mirror for distfiles
+          XBPS_DISTFILES_MIRROR=https://repo-fastly.voidlinux.org/current
+          EOF
+
+          echo "=== void-packages/etc/conf (tail) ==="
+          tail -5 etc/conf
+          echo
           echo "=== Template head (sanity check) ==="
           grep -E '^(version|revision|_rollup|_commit_id)=' srcpkgs/ungoogled-chromium/template
 
