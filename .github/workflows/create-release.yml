@@ -157,15 +157,27 @@ jobs:
         # into the chroot and selects the right repos-remote-*.conf
         # based on XBPS_ARCH (which xbps-src sets from -A). We rewrite
         # those files in the next step to also point at Fastly.
+        #
+        # IMPORTANT: do NOT install `base-chroot` on the host. That package
+        # is a bootstrap meta-package that lives in the `bootstrap` subrepo
+        # (its template declares `repository=bootstrap`). It is what
+        # xbps-src installs INSIDE the masterdir when you run
+        # `binary-bootstrap` — never on the host. Trying to install it on
+        # the host fails with "package 'base-chroot' not found" because
+        # the standard /current/ repo doesn't ship it.
+        #
+        # The void-mklive image already ships: xbps, bash, make, git, kmod,
+        # xz, lzo, qemu-user-{arm,aarch64}, binfmt-support, outils,
+        # dosfstools, e2fsprogs. We only need to add xtools (for xgensum),
+        # sudo (for the builder user), openssl (for xbps-rindex signing),
+        # and ca-certificates (for HTTPS).
         run: |
           echo "Target arch:    ${TARGET_ARCH}  (only used by xbps-src -A)"
           echo "Host arch:      $(xbps-uhelper arch)  (always glibc on this image)"
 
           # Wipe any xbps.d fragments the image might ship and write a
           # single one pointing at the Fastly glibc repo. NOTE: no trailing
-          # slash — xbps-install appends '/<arch>-repodata' itself, and a
-          # double slash in the URL looks ugly in logs even though most
-          # servers normalize it.
+          # slash — xbps-install appends '/<arch>-repodata' itself.
           rm -f /etc/xbps.d/*.conf
           mkdir -p /etc/xbps.d
           cat > /etc/xbps.d/00-repository-main.conf <<'EOF'
@@ -176,13 +188,20 @@ jobs:
           cat /etc/xbps.d/00-repository-main.conf
 
           # Two-step update: upgrade xbps itself first (so it can handle
-          # current repo signatures), then the rest of the system, then
-          # the runtime deps we need for xbps-src + signing.
+          # current repo signatures), then the rest of the system. -y to
+          # answer yes; -d to just download on the second pass if needed.
           xbps-install -Syu xbps
           xbps-install -Suyd
-          xbps-install -y \
-            base-chroot base-devel git curl ca-certificates \
-            python3 bash sudo xtools openssl tar xz
+          # Now apply the upgrades (the -d above only downloads).
+          xbps-install -Syu
+
+          # Install the runtime deps the void-mklive image doesn't ship.
+          # Verified URLs (all return HTTP 200 from /current/):
+          #   xtools-0.70_1.x86_64.xbps
+          #   sudo-1.9.17p2_1.x86_64.xbps
+          #   openssl-3.6.3_1.x86_64.xbps
+          #   ca-certificates-20250419+3.125_1.x86_64.xbps
+          xbps-install -y xtools sudo openssl ca-certificates
 
           # Create the build user. xbps-src refuses to run as root, and the
           # setuid xbps-uchroot helper requires group 'xbuilder'.
@@ -388,3 +407,4 @@ jobs:
           delete_tags: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#   - void-mklive only publishes amd64/arm64 glibc images. There is no musl
