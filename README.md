@@ -4,11 +4,11 @@ Ungoogled Chromium template and builds for Void Linux, based on the void-package
 <!-- VERSION-INFO-START -->
 | **Component**                                 | **Version**        |
 |-----------------------------------------------|--------------------|
-| **[Chromium (google)](https://chromium.googlesource.com/chromium/src)**                           | `149.0.7827.114` |
-| **[ungoogled-chromium (ungoogled-software)](https://github.com/ungoogled-software/ungoogled-chromium)**                          | `149.0.7827.114` |
-| **[ungoogled-chromium-void (DAINRA)](https://github.com/DAINRA/ungoogled-chromium-void)**                             | `148.0.7778.178` |
+| **[Chromium (google)](https://chromium.googlesource.com/chromium/src)**                           | `150.0.7871.186` |
+| **[ungoogled-chromium (ungoogled-software)](https://github.com/ungoogled-software/ungoogled-chromium)**                          | `150.0.7871.186` |
+| **[ungoogled-chromium-void (KevinRunforrestt)](https://github.com/KevinRunforrestt/ungoogled-chromium-void)**                             | `150.0.7871.186_1` |
 
-<sub>***Updated: 2026-06-12 23:07:18 UTC***</sub>
+<sub>***Updated: 2026-07-26 21:19:32 UTC***</sub>
 <!-- VERSION-INFO-END -->
 
 ## Content Overview
