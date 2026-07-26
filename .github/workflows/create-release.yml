@@ -1,5 +1,33 @@
 name: Create release
 
+# This workflow builds ungoogled-chromium for x86_64 (glibc) and x86_64-musl
+# on GitHub-hosted runners, using the official voidlinux Docker images.
+#
+# Flow:
+#   Fetch   (ubuntu-latest)        - reads version/revision from template
+#   Build   (ubuntu-latest + Docker voidlinux) - matrix [x86_64, x86_64-musl]
+#           - runs xbps-src binary-bootstrap / fetch / pkg
+#           - xbps-src internally calls xbps-create to assemble the .xbps
+#             from the DESTDIR produced by do_install
+#           - optionally signs the packages with the SHIRAORI_PEM secret
+#           - uploads the .xbps (+.sig2) as workflow artifacts
+#   Release (ubuntu-latest)        - downloads artifacts, creates GitHub release
+#   Cleanup  (ubuntu-latest)       - prunes old releases (keep_latest: 5)
+#
+# Required secrets (Settings → Secrets and variables → Actions):
+#   SUPERBIA       - passphrase for shiraori.pem (used by xbps-rindex --sign)
+#   SHIRAORI_PEM   - private key (PEM body) used to sign packages
+# If SHIRAORI_PEM is empty, the sign step is skipped (release still happens,
+# just without signatures).
+#
+# Resource notes:
+#   ubuntu-latest         = 4 cores,  16 GB RAM, 14 GB disk
+#   ubuntu-latest-large   = 8 cores,  32 GB RAM, 64 GB disk  (requires Team plan)
+#   ubuntu-latest-xlarge  = 16 cores, 64 GB RAM, 80 GB disk  (requires Team plan)
+# Chromium links with ~30 GB RAM when LTO is off (it is, per template).
+# On ubuntu-latest the build WILL run but may OOM-kill the linker; if that
+# happens, bump runs-on to ubuntu-latest-large or ubuntu-latest-xlarge.
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: false
@@ -15,18 +43,18 @@ on:
 jobs:
   Fetch:
     if: github.repository == 'KevinRunforrestt/ungoogled-chromium-void'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       ver: ${{ steps.version.outputs.ver }}
       rev: ${{ steps.version.outputs.rev }}
       skip_ci: ${{ steps.ci_skip_check.outputs.skip_ci }}
-    environment:
-      name: release
     steps:
       - name: Check for [ci-skip] in commit message
         id: ci_skip_check
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          if echo "${{ github.event.head_commit.message }}" | grep -iqE '\[ci-skip\]|\[skip ci\]'; then
+          if echo "${COMMIT_MSG}" | grep -iqE '\[ci-skip\]|\[skip ci\]'; then
             echo "CI skip detected. Skipping further steps."
             echo "skip_ci=true" >> $GITHUB_OUTPUT
           else
@@ -34,126 +62,236 @@ jobs:
           fi
         shell: bash
 
-      - name: Fetch repository
+      - name: Fetch this repository
         if: steps.ci_skip_check.outputs.skip_ci == 'false'
         uses: actions/checkout@v4
         with:
           path: master
 
-      - name: Fetch void-packages
+      - name: Read version/revision
         if: steps.ci_skip_check.outputs.skip_ci == 'false'
+        id: version
+        run: |
+          echo "ver=$( grep -m 1 'version='  master/void-packages/srcpkgs/ungoogled-chromium/template | awk -F '=' '{ print $2 }' )" >> $GITHUB_OUTPUT
+          echo "rev=$( grep -m 1 'revision=' master/void-packages/srcpkgs/ungoogled-chromium/template | awk -F '=' '{ print $2 }' )" >> $GITHUB_OUTPUT
+
+  Build:
+    needs: [Fetch]
+    if: needs.Fetch.outputs.skip_ci == 'false'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch: x86_64
+            image: voidlinux/voidlinux:latest
+          - arch: x86_64-musl
+            image: voidlinux/voidlinux-musl:latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    env:
+      VER: ${{ needs.Fetch.outputs.ver }}
+      REV: ${{ needs.Fetch.outputs.rev }}
+      ARCH: ${{ matrix.arch }}
+      IMAGE: ${{ matrix.image }}
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: master
+
+      - name: Checkout void-packages
         uses: actions/checkout@v4
         with:
           repository: void-linux/void-packages
           path: void-packages
+          fetch-depth: 1
 
-      - name: Configure void-packages
-        if: steps.ci_skip_check.outputs.skip_ci == 'false'
+      - name: Overlay our template onto void-packages
         run: |
-          cp -r master/void-packages ./ 2>/dev/null
+          rm -rf void-packages/srcpkgs/ungoogled-chromium
+          rm -rf void-packages/srcpkgs/ungoogled-chromium-qt6
+          cp -r master/void-packages/srcpkgs/ungoogled-chromium    void-packages/srcpkgs/
+          cp -r master/void-packages/srcpkgs/ungoogled-chromium-qt6 void-packages/srcpkgs/
+          echo "=== Template head (sanity) ==="
+          grep -E '^(version|revision|_rollup)=' void-packages/srcpkgs/ungoogled-chromium/template
 
-      - name: Update checksums automatically
-        if: steps.ci_skip_check.outputs.skip_ci == 'false'
+      - name: Free up disk space on the runner
         run: |
-          # Asegurar que xtools está instalado en el runner
-          if ! command -v xgensum >/dev/null 2>&1; then
-            echo "Installing xtools..."
-            sudo xbps-install -y xtools || xbps-install -y xtools
+          # ubuntu-latest ships with ~14 GB free; chromium sources + build
+          # easily eat 60 GB. Remove things we don't need.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost /usr/local/share/powershell \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Python/*/x64/lib/python*/site-packages/{pip,setuptools,wheel}-* \
+                      2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Build ungoogled-chromium inside Void Linux container
+        env:
+          XBPS_PASSPHRASE: ${{ secrets.SUPERBIA }}
+        run: |
+          # `docker run --privileged` is required so xbps-src can use
+          # xbps-uchroot (which needs user namespaces + chroot capability).
+          # GitHub-hosted runners DO allow --privileged on docker run.
+          #
+          # Inside the container we:
+          #   1. Update xbps itself (otherwise old xbps may fail on new repo sigs)
+          #   2. Install xbps-src runtime deps + tools needed for signing
+          #   3. Run binary-bootstrap for the target arch (sets up the build chroot)
+          #   4. Fetch distfiles (chromium tarball + ungoogled-chromium + rollup)
+          #   5. Build the package — `xbps-src pkg` internally:
+          #        - runs do_configure / do_build / do_install
+          #        - calls `xbps-create` to assemble the .xbps from $DESTDIR
+          #        - calls `xbps-rindex -a` to add it to hostdir/binpkgs
+          docker run --rm --privileged \
+            -v "$PWD":/work -w /work \
+            -e XBPS_TARGET_ARCH="${ARCH}" \
+            -e XBPS_ARCH="${ARCH}" \
+            -e XBPS_PASSPHRASE="${XBPS_PASSPHRASE}" \
+            "${IMAGE}" \
+            bash -eux -c '
+              # 1. Update xbps itself first (the 2021 image ships an old xbps
+              #    that may not parse current repo signatures). Then update
+              #    the whole base system. Two-step to avoid the classic
+              #    "xbps needs to be updated before it can update itself" loop.
+              xbps-install -Sy xbps || true
+              xbps-install -Syu || true
+              # Second pass: any packages held back because xbps was being
+              # upgraded land in the second transaction.
+              xbps-install -Syu || true
+
+              # 2. Install everything xbps-src + signing needs at runtime.
+              xbps-install -Sy \
+                base-chroot base-devel git curl ca-certificates \
+                python3 bash sudo xtools openssl tar xz
+
+              cd /work/void-packages
+
+              # 3. Bootstrap the target arch — creates the build chroot under
+              #    masterdir/ and installs the hostmakedepends + makedepends
+              #    declared by the template.
+              ./xbps-src -A "${ARCH}" binary-bootstrap
+
+              # 4. Fetch distfiles (verifies sha256 against the template).
+              ./xbps-src -A "${ARCH}" fetch ungoogled-chromium
+
+              # 5. Build the package. -C = use ccache (cache lives in
+              #    hostdir/ccache, persists across reruns of the same job
+              #    only if you enable actions/cache — see below).
+              ./xbps-src -A "${ARCH}" -C pkg ungoogled-chromium
+
+              # 6. List the produced .xbps files.
+              echo "=== Produced packages ==="
+              ls -la hostdir/binpkgs/ungoogled-chromium* || true
+            '
+
+      - name: Sign packages (optional — only if SHIRAORI_PEM is set)
+        env:
+          SHIRAORI_PEM: ${{ secrets.SHIRAORI_PEM }}
+          XBPS_PASSPHRASE: ${{ secrets.SUPERBIA }}
+          PKG_VER: ${{ needs.Fetch.outputs.ver }}
+          PKG_REV: ${{ needs.Fetch.outputs.rev }}
+        run: |
+          if [ -z "${SHIRAORI_PEM}" ]; then
+            echo "SHIRAORI_PEM secret is not set — skipping signing step."
+            echo "Packages will still be released, just without .sig2 signatures."
+            exit 0
           fi
-          
-          cd void-packages
-          echo "Generating checksums for ungoogled-chromium..."
-          # xgensum descargará las fuentes, calculará el SHA256 y actualizará el template
-          xgensum -f ungoogled-chromium
-          
-          echo "Checksums actualizados en el template:"
-          grep -A 3 '^checksum=' srcpkgs/ungoogled-chromium/template
+          # NB: we pass PKG_VER/PKG_REV explicitly (rather than relying on VER/REV
+          # from the job env) so the sign step is self-contained and easy to read.
+          docker run --rm --privileged \
+            -v "$PWD":/work -w /work \
+            -e SHIRAORI_PEM="${SHIRAORI_PEM}" \
+            -e XBPS_PASSPHRASE="${XBPS_PASSPHRASE}" \
+            -e PKG_VER="${PKG_VER}" \
+            -e PKG_REV="${PKG_REV}" \
+            -e ARCH="${ARCH}" \
+            "${IMAGE}" \
+            bash -eu -c '
+              printf "%s\n" "${SHIRAORI_PEM}" > /tmp/shiraori.pem
+              chmod 600 /tmp/shiraori.pem
 
-      - id: version
-        if: steps.ci_skip_check.outputs.skip_ci == 'false'
-        run: |
-          echo "ver=$( grep -m 1 'version=' master/void-packages/srcpkgs/ungoogled-chromium/template | awk -F '=' '{ print $2 }' )" >> $GITHUB_OUTPUT
-          echo "rev=$( grep -m 1 'revision=' master/void-packages/srcpkgs/ungoogled-chromium/template | awk -F '=' '{ print $2 }' )" >> $GITHUB_OUTPUT
+              cd /work/void-packages/hostdir/binpkgs
+              # xbps-rindex names the repodata file after the architecture
+              # (e.g. "x86_64-repodata" or "x86_64-musl-repodata").
+              rm -f "${ARCH}-repodata"
 
-  Bootstrap:
-    needs: [Fetch]
-    if: needs.Fetch.outputs.skip_ci == 'false'
-    strategy:
-      max-parallel: 1
-      matrix:
-        arch: [x86_64, x86_64-musl]
-    runs-on: self-hosted
+              xbps-rindex -a "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
+              xbps-rindex -a "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
+
+              xbps-rindex --sign --signedby "Shiraori archive" \
+                --privkey /tmp/shiraori.pem "$PWD"
+
+              xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
+                "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
+              xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
+                "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
+
+              echo "=== Signed packages ==="
+              ls -la ungoogled-chromium* "${ARCH}-repodata" 2>/dev/null || true
+            '
+
+      - name: Upload binpkgs as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binpkgs-${{ matrix.arch }}
+          path: |
+            void-packages/hostdir/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
+            void-packages/hostdir/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
+            void-packages/hostdir/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
+            void-packages/hostdir/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
+            void-packages/hostdir/binpkgs/${{ matrix.arch }}-repodata
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+
+  Release:
+    needs: [Fetch, Build]
+    if: needs.Fetch.outputs.skip_ci == 'false' && always() && needs.Build.result == 'success'
+    runs-on: ubuntu-latest
     steps:
-      - name: Bootstrap ${{ matrix.arch }}
-        run: |
-          cd void-packages
-          ./xbps-src -H /repository -A ${{ matrix.arch }} binary-bootstrap
-          ./xbps-src -H /repository -A ${{ matrix.arch }} fetch ungoogled-chromium
+      - name: Download all binpkgs artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: binpkgs
+          pattern: binpkgs-*
+          merge-multiple: true
 
-  Configure:
-    needs: [Bootstrap]
-    if: needs.Fetch.outputs.skip_ci == 'false'
-    strategy:
-      max-parallel: 1
-      matrix:
-        arch: [x86_64, x86_64-musl]
-    runs-on: self-hosted
-    steps:
-      - name: Configure ${{ matrix.arch }}
+      - name: List downloaded artifacts
         run: |
-          cd void-packages
-          ./xbps-src -H /repository -A ${{ matrix.arch }} -C configure ungoogled-chromium
+          echo "=== Downloaded .xbps files ==="
+          ls -la binpkgs/ || true
 
-  Build:
-    needs: [Fetch, Configure]
-    if: needs.Fetch.outputs.skip_ci == 'false'
-    strategy:
-      max-parallel: 1
-      matrix:
-        arch: [x86_64, x86_64-musl]
-    runs-on: self-hosted
-    timeout-minutes: 1440
-    env:
-      XBPS_TARGET_ARCH: ${{ matrix.arch }}
-      XBPS_PASSPHRASE: ${{ secrets.SUPERBIA }}
-    steps:
-      - name: Build ${{ matrix.arch }}
-        run: |
-          cd void-packages
-          ./xbps-src -H /repository -A ${{ matrix.arch }} -C pkg ungoogled-chromium
-
-      - name: Sign ${{ matrix.arch }} package
-        run: |
-          cd /repository/binpkgs
-          rm -f ${{ matrix.arch }}-repodata
-          xbps-rindex -a ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-          xbps-rindex -a ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-          xbps-rindex --sign --signedby "Shiraori archive" --privkey /repository/shiraori.pem $PWD
-          xbps-rindex --sign-pkg --privkey /repository/shiraori.pem ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-          xbps-rindex --sign-pkg --privkey /repository/shiraori.pem ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-
-      - name: Release ${{ matrix.arch }} assets
+      - name: Create / update GitHub release
         uses: softprops/action-gh-release@v2
         with:
           body: |
-            Chromium release: <a href='https://chromium.googlesource.com/chromium/src/+/refs/tags/${{ needs.Fetch.outputs.ver }}'>${{ needs.Fetch.outputs.ver }}</a>
-            Ungoogled Chromium release: <a href='https://github.com/ungoogled-software/ungoogled-chromium/releases/tag/${{ needs.Fetch.outputs.ver }}-${{ needs.Fetch.outputs.rev }}'>${{ needs.Fetch.outputs.ver }}-${{ needs.Fetch.outputs.rev }}</a>
+            Chromium release: ${{ needs.Fetch.outputs.ver }}
+            Ungoogled Chromium release: ${{ needs.Fetch.outputs.ver }}-${{ needs.Fetch.outputs.rev }}
           files: |
-            /repository/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-            /repository/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-            /repository/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
-            /repository/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
-            /repository/binpkgs/${{ matrix.arch }}-repodata
+            binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64.xbps
+            binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64.xbps
+            binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64.xbps.sig2
+            binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64.xbps.sig2
+            binpkgs/x86_64-repodata
+            binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64-musl.xbps
+            binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64-musl.xbps
+            binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64-musl.xbps.sig2
+            binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.x86_64-musl.xbps.sig2
+            binpkgs/x86_64-musl-repodata
           tag_name: ${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}
+          fail_on_unmatched_files: false
 
   Cleanup:
-    needs: [Build]
-    if: needs.Fetch.outputs.skip_ci == 'false'
-    runs-on: self-hosted
+    needs: [Release]
+    if: always()
+    runs-on: ubuntu-latest
     steps:
-      - name: Cleanup old release files
+      - name: Cleanup old release files (keep 5 latest)
         uses: dev-drprasad/delete-older-releases@v0.3.3
         with:
           keep_latest: 5
+          delete_tags: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
