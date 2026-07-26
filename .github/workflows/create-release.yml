@@ -1,18 +1,40 @@
 name: Create release
 
 # This workflow builds ungoogled-chromium for x86_64 (glibc) and x86_64-musl
-# on GitHub-hosted runners, using the official voidlinux Docker images.
+# on GitHub-hosted runners, using the official void-linux/void-mklive image
+# on GHCR (the same one used by github.com/javiercplus/repo-neko).
+#
+# Why void-mklive instead of voidlinux/voidlinux?
+#   - The 2021 voidlinux/voidlinux{,-musl} images on Docker Hub ship an xbps
+#     so old that it can't validate current TLS certificates
+#     ("SSL certificate subject doesn't match host ... Operation not permitted").
+#   - void-mklive is built from the live ISO master and is refreshed regularly
+#     (tags like 20250116R1, 20250227R1). It ships a modern xbps + modern
+#     ca-certificates, so `xbps-install -Syu` works out of the box.
+#
+# Why a single glibc image for both arches?
+#   - void-mklive only publishes amd64/arm64 glibc images. There is no musl
+#     variant. We don't need one: xbps-src's `-A x86_64-musl` flag does a
+#     cross-build from a glibc host, downloading the musl bootstrap tarball
+#     from repo-default.voidlinux.org/current/musl. This is exactly how the
+#     void-linux/void-packages CI itself tests musl builds.
 #
 # Flow:
-#   Fetch   (ubuntu-latest)        - reads version/revision from template
-#   Build   (ubuntu-latest + Docker voidlinux) - matrix [x86_64, x86_64-musl]
-#           - runs xbps-src binary-bootstrap / fetch / pkg
-#           - xbps-src internally calls xbps-create to assemble the .xbps
-#             from the DESTDIR produced by do_install
-#           - optionally signs the packages with the SHIRAORI_PEM secret
-#           - uploads the .xbps (+.sig2) as workflow artifacts
-#   Release (ubuntu-latest)        - downloads artifacts, creates GitHub release
-#   Cleanup  (ubuntu-latest)       - prunes old releases (keep_latest: 5)
+#   Fetch   (ubuntu-latest)  - reads version/revision from the template
+#   Build   (ubuntu-22.04 + container void-mklive, matrix [glibc, musl])
+#           - updates xbps itself before anything else (uses --repository
+#             to bypass the broken default mirror config)
+#           - installs runtime deps + xtools + sudo
+#           - creates a 'builder' user in group 'xbuilder' so xbps-src can
+#             use xbps-uchroot via the setuid helper
+#           - clones void-packages, overlays our template
+#           - runs: binary-bootstrap  →  fetch  →  pkg
+#             (xbps-src internally calls xbps-create to assemble the .xbps
+#              from $DESTDIR, then xbps-rindex -a to add it to hostdir/binpkgs)
+#           - optionally signs packages with the SHIRAORI_PEM secret
+#           - uploads .xbps (+.sig2 + repodata) as workflow artifacts
+#   Release (ubuntu-latest)  - downloads both arch artifacts, creates release
+#   Cleanup  (ubuntu-latest) - prunes old releases (keep_latest: 5)
 #
 # Required secrets (Settings → Secrets and variables → Actions):
 #   SUPERBIA       - passphrase for shiraori.pem (used by xbps-rindex --sign)
@@ -83,169 +105,129 @@ jobs:
       max-parallel: 2
       matrix:
         include:
+          # XBPS_ARCH is what xbps-src will pass to its target. -A is the
+          # shortcut xbps-src exposes for setting it.
+          #   x86_64       = native glibc build (container is glibc/amd64)
+          #   x86_64-musl  = cross build: glibc host compiles musl target via
+          #                  the musl bootstrap tarball from
+          #                  repo-default.voidlinux.org/current/musl
           - arch: x86_64
-            image: voidlinux/voidlinux:latest
+            description: "glibc"
           - arch: x86_64-musl
-            image: voidlinux/voidlinux-musl:latest
-    runs-on: ubuntu-latest
+            description: "musl"
+    # ubuntu-22.04 is what repo-neko uses and is known to work with
+    # `container: image: ghcr.io/void-linux/void-mklive:...` + --privileged.
+    runs-on: ubuntu-22.04
     timeout-minutes: 1440
+    container:
+      image: ghcr.io/void-linux/void-mklive:20250116R1
+      options: --privileged
     env:
-      VER: ${{ needs.Fetch.outputs.ver }}
-      REV: ${{ needs.Fetch.outputs.rev }}
-      ARCH: ${{ matrix.arch }}
-      IMAGE: ${{ matrix.image }}
+      XBPS_TARGET_ARCH: ${{ matrix.arch }}
+      PKG_VER: ${{ needs.Fetch.outputs.ver }}
+      PKG_REV: ${{ needs.Fetch.outputs.rev }}
     steps:
+      - name: Fix SSL and install tools
+        # Mirror repo-neko's bootstrap exactly: --repository bypasses the
+        # image's default mirror config (which may point to a stale mirror)
+        # and forces repo-de.voidlinux.org/current/, the canonical EU mirror.
+        # Two-step: update xbps first, then the rest of the system.
+        run: |
+          xbps-install -Syu --repository=https://repo-de.voidlinux.org/current/ xbps
+          xbps-install -Suyd --repository=https://repo-de.voidlinux.org/current/
+          xbps-install -y --repository=https://repo-de.voidlinux.org/current/ \
+            base-chroot base-devel git curl ca-certificates \
+            python3 bash sudo xtools openssl tar xz
+
+          # Create the build user. xbps-src refuses to run as root, and the
+          # setuid xbps-uchroot helper requires group 'xbuilder'.
+          groupadd -f xbuilder
+          useradd -m -s /bin/bash -G xbuilder builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+
       - name: Checkout this repository
         uses: actions/checkout@v4
         with:
-          path: master
+          path: repo
 
-      - name: Checkout void-packages
-        uses: actions/checkout@v4
-        with:
-          repository: void-linux/void-packages
-          path: void-packages
-          fetch-depth: 1
-
-      - name: Overlay our template onto void-packages
+      - name: Clone void-packages and overlay our template
+        env:
+          # GITHUB_WORKSPACE inside a `container:` block points at the
+          # mount root (typically /__w/<repo>/<repo>). The `repo/` subdir
+          # is where actions/checkout just dropped our source tree.
+          WS: ${{ github.workspace }}
         run: |
-          rm -rf void-packages/srcpkgs/ungoogled-chromium
-          rm -rf void-packages/srcpkgs/ungoogled-chromium-qt6
-          cp -r master/void-packages/srcpkgs/ungoogled-chromium    void-packages/srcpkgs/
-          cp -r master/void-packages/srcpkgs/ungoogled-chromium-qt6 void-packages/srcpkgs/
-          echo "=== Template head (sanity) ==="
-          grep -E '^(version|revision|_rollup)=' void-packages/srcpkgs/ungoogled-chromium/template
+          git clone --depth 1 https://github.com/void-linux/void-packages.git /tmp/void-packages
+          cd /tmp/void-packages
 
-      - name: Free up disk space on the runner
-        run: |
-          # ubuntu-latest ships with ~14 GB free; chromium sources + build
-          # easily eat 60 GB. Remove things we don't need.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/.ghcup /usr/local/share/boost /usr/local/share/powershell \
-                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Python/*/x64/lib/python*/site-packages/{pip,setuptools,wheel}-* \
-                      2>/dev/null || true
-          sudo apt-get clean
-          df -h /
+          # Replace the upstream ungoogled-chromium template with ours.
+          rm -rf srcpkgs/ungoogled-chromium srcpkgs/ungoogled-chromium-qt6
+          cp -r "${WS}/repo/void-packages/srcpkgs/ungoogled-chromium"    srcpkgs/
+          cp -r "${WS}/repo/void-packages/srcpkgs/ungoogled-chromium-qt6" srcpkgs/
 
-      - name: Build ungoogled-chromium inside Void Linux container
+          echo "=== Template head (sanity check) ==="
+          grep -E '^(version|revision|_rollup|_commit_id)=' srcpkgs/ungoogled-chromium/template
+
+          chown -R builder:builder /tmp/void-packages
+
+      - name: Build ungoogled-chromium (${{ matrix.description }})
         env:
           XBPS_PASSPHRASE: ${{ secrets.SUPERBIA }}
         run: |
-          # `docker run --privileged` is required so xbps-src can use
-          # xbps-uchroot (which needs user namespaces + chroot capability).
-          # GitHub-hosted runners DO allow --privileged on docker run.
-          #
-          # Inside the container we:
-          #   1. Update xbps itself (otherwise old xbps may fail on new repo sigs)
-          #   2. Install xbps-src runtime deps + tools needed for signing
-          #   3. Run binary-bootstrap for the target arch (sets up the build chroot)
-          #   4. Fetch distfiles (chromium tarball + ungoogled-chromium + rollup)
-          #   5. Build the package — `xbps-src pkg` internally:
-          #        - runs do_configure / do_build / do_install
-          #        - calls `xbps-create` to assemble the .xbps from $DESTDIR
-          #        - calls `xbps-rindex -a` to add it to hostdir/binpkgs
-          docker run --rm --privileged \
-            -v "$PWD":/work -w /work \
-            -e XBPS_TARGET_ARCH="${ARCH}" \
-            -e XBPS_ARCH="${ARCH}" \
-            -e XBPS_PASSPHRASE="${XBPS_PASSPHRASE}" \
-            "${IMAGE}" \
-            /bin/sh -eux -c '
-              # NB: we use /bin/sh (not bash) because the 2021 base images,
-              # especially the musl one, do NOT ship bash in $PATH. We install
-              # bash below as part of the runtime deps; xbps-src requires it.
-              #
-              # 1. Update xbps itself first (the 2021 image ships an old xbps
-              #    that may not parse current repo signatures). Then update
-              #    the whole base system. Two-step to avoid the classic
-              #    "xbps needs to be updated before it can update itself" loop.
-              xbps-install -Sy xbps || true
-              xbps-install -Syu || true
-              # Second pass: any packages held back because xbps was being
-              # upgraded land in the second transaction.
-              xbps-install -Syu || true
+          # Run as 'builder' so xbps-src can use xbps-uchroot (setuid).
+          # -A ${{ matrix.arch }} tells xbps-src the target arch. For musl,
+          # xbps-src will automatically download the musl bootstrap tarball
+          # from the musl/ subrepo.
+          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${XBPS_TARGET_ARCH}"' binary-bootstrap'
+          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${XBPS_TARGET_ARCH}"' fetch ungoogled-chromium'
+          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${XBPS_TARGET_ARCH}"' -C pkg ungoogled-chromium'
 
-              # 2. Install everything xbps-src + signing needs at runtime.
-              xbps-install -Sy \
-                base-chroot base-devel git curl ca-certificates \
-                python3 bash sudo xtools openssl tar xz
-
-              cd /work/void-packages
-
-              # 3. Bootstrap the target arch — creates the build chroot under
-              #    masterdir/ and installs the hostmakedepends + makedepends
-              #    declared by the template.
-              ./xbps-src -A "${ARCH}" binary-bootstrap
-
-              # 4. Fetch distfiles (verifies sha256 against the template).
-              ./xbps-src -A "${ARCH}" fetch ungoogled-chromium
-
-              # 5. Build the package. -C = use ccache (cache lives in
-              #    hostdir/ccache, persists across reruns of the same job
-              #    only if you enable actions/cache — see below).
-              ./xbps-src -A "${ARCH}" -C pkg ungoogled-chromium
-
-              # 6. List the produced .xbps files.
-              echo "=== Produced packages ==="
-              ls -la hostdir/binpkgs/ungoogled-chromium* || true
-            '
+          echo "=== Produced packages ==="
+          ls -la /tmp/void-packages/hostdir/binpkgs/ungoogled-chromium* || true
 
       - name: Sign packages (optional — only if SHIRAORI_PEM is set)
         env:
           SHIRAORI_PEM: ${{ secrets.SHIRAORI_PEM }}
           XBPS_PASSPHRASE: ${{ secrets.SUPERBIA }}
-          PKG_VER: ${{ needs.Fetch.outputs.ver }}
-          PKG_REV: ${{ needs.Fetch.outputs.rev }}
         run: |
           if [ -z "${SHIRAORI_PEM}" ]; then
             echo "SHIRAORI_PEM secret is not set — skipping signing step."
             echo "Packages will still be released, just without .sig2 signatures."
             exit 0
           fi
-          # NB: we pass PKG_VER/PKG_REV explicitly (rather than relying on VER/REV
-          # from the job env) so the sign step is self-contained and easy to read.
-          docker run --rm --privileged \
-            -v "$PWD":/work -w /work \
-            -e SHIRAORI_PEM="${SHIRAORI_PEM}" \
-            -e XBPS_PASSPHRASE="${XBPS_PASSPHRASE}" \
-            -e PKG_VER="${PKG_VER}" \
-            -e PKG_REV="${PKG_REV}" \
-            -e ARCH="${ARCH}" \
-            "${IMAGE}" \
-            /bin/sh -eu -c '
-              printf "%s\n" "${SHIRAORI_PEM}" > /tmp/shiraori.pem
-              chmod 600 /tmp/shiraori.pem
 
-              cd /work/void-packages/hostdir/binpkgs
-              # xbps-rindex names the repodata file after the architecture
-              # (e.g. "x86_64-repodata" or "x86_64-musl-repodata").
-              rm -f "${ARCH}-repodata"
+          printf '%s\n' "${SHIRAORI_PEM}" > /tmp/shiraori.pem
+          chmod 600 /tmp/shiraori.pem
 
-              xbps-rindex -a "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
-              xbps-rindex -a "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
+          cd /tmp/void-packages/hostdir/binpkgs
+          # xbps-rindex names the repodata file after the target arch.
+          rm -f "${XBPS_TARGET_ARCH}-repodata"
 
-              xbps-rindex --sign --signedby "Shiraori archive" \
-                --privkey /tmp/shiraori.pem "$PWD"
+          xbps-rindex -a "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
+          xbps-rindex -a "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
 
-              xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
-                "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
-              xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
-                "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${ARCH}.xbps"
+          xbps-rindex --sign --signedby "Shiraori archive" \
+            --privkey /tmp/shiraori.pem "$PWD"
 
-              echo "=== Signed packages ==="
-              ls -la ungoogled-chromium* "${ARCH}-repodata" 2>/dev/null || true
-            '
+          xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
+            "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
+          xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
+            "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
+
+          rm -f /tmp/shiraori.pem
+          echo "=== Signed packages ==="
+          ls -la ungoogled-chromium* "${XBPS_TARGET_ARCH}-repodata" 2>/dev/null || true
 
       - name: Upload binpkgs as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: binpkgs-${{ matrix.arch }}
           path: |
-            void-packages/hostdir/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-            void-packages/hostdir/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
-            void-packages/hostdir/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
-            void-packages/hostdir/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
-            void-packages/hostdir/binpkgs/${{ matrix.arch }}-repodata
+            /tmp/void-packages/hostdir/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
+            /tmp/void-packages/hostdir/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps
+            /tmp/void-packages/hostdir/binpkgs/ungoogled-chromium-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
+            /tmp/void-packages/hostdir/binpkgs/ungoogled-chromium-qt6-${{ needs.Fetch.outputs.ver }}_${{ needs.Fetch.outputs.rev }}.${{ matrix.arch }}.xbps.sig2
+            /tmp/void-packages/hostdir/binpkgs/${{ matrix.arch }}-repodata
           if-no-files-found: warn
           retention-days: 14
           compression-level: 0
