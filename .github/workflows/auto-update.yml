@@ -122,10 +122,10 @@ jobs:
         run: |
           # A GITHUB_TOKEN push does not retrigger push-triggered workflows,
           # but workflow_dispatch IS allowed from GITHUB_TOKEN. Trigger the
-          # build pipeline on the commit we just pushed.
-          gh workflow run create-release.yml \
-            --ref "${{ github.ref_name }}" \
-            -f commit_sha="${{ steps.commit.outputs.commit_sha }}"
+          # build pipeline on the ref we just pushed to. create-release.yml
+          # has no workflow_dispatch inputs, so we must NOT pass any -f flags
+          # (GitHub returns HTTP 422 "Unexpected inputs" if we do).
+          gh workflow run create-release.yml --ref "${{ github.ref_name }}"
           echo "create-release.yml dispatched on ${{ github.ref_name }} @ ${{ steps.commit.outputs.commit_sha }}"
 
       - name: Summary (no update)
