@@ -137,46 +137,44 @@ jobs:
     steps:
       - name: Force Fastly CDN mirror and install tools
         # ============================================================
-        # CRITICAL — do this BEFORE any xbps-install call.
+        # CRITICAL — read this before editing.
         # ============================================================
-        # The container image ships /etc/xbps.d/*.conf pointing at
-        # alpha.de.repo.voidlinux.org, which has (a) expired/mismatched
-        # TLS certs and (b) the host no longer exists. Even when we pass
-        # --repository=... explicitly, xbps-install still ALSO reads the
-        # /etc/xbps.d fragments and tries to sync those repos, producing
-        # the "SSL certificate subject doesn't match host" errors.
+        # The container (ghcr.io/void-linux/void-mklive) is ALWAYS glibc
+        # on amd64, even when we cross-build for musl. So the HOST's
+        # /etc/xbps.d/ must ONLY list glibc repos — listing the musl repo
+        # here caused xbps-install to download musl .xbps packages
+        # (musl-1.2.5_3, xbps-0.60.7_1.x86_64-musl.xbps, ...) and install
+        # them on top of the glibc rootfs, which produced:
+        #   Error relocating /lib/libarchive.so.13: __open_2: symbol not found
+        #   Error relocating /lib/libarchive.so.13: __snprintf_chk: symbol not found
+        #   ... (and exit code 127)
         #
-        # Fix: wipe every xbps.d fragment and write a single one pointing
-        # at the Fastly CDN mirror. This affects EVERY xbps-* command in
-        # this job (xbps-install, xbps-query, xbps-rindex, AND the ones
-        # xbps-src invokes internally later).
+        # The musl repo IS still needed, but only INSIDE the xbps-src
+        # build chroot — xbps-src copies void-packages/etc/xbps.d/
+        # into the chroot and selects the right repos-remote-*.conf
+        # based on XBPS_ARCH. We rewrite those files in a later step
+        # to also point at Fastly.
         env:
           XBPS_REPO: ${{ matrix.repo }}
         run: |
           echo "Target arch:    ${XBPS_TARGET_ARCH}"
-          echo "Using XBPS repo: ${XBPS_REPO}"
+          echo "Using XBPS repo: ${XBPS_REPO}  (used only for the musl target inside xbps-src)"
 
+          # The HOST container is glibc, regardless of XBPS_TARGET_ARCH.
+          # Wipe any xbps.d fragments the image might ship and write a
+          # single one pointing at the Fastly glibc repo.
           rm -f /etc/xbps.d/*.conf
           mkdir -p /etc/xbps.d
-          if [ "${XBPS_TARGET_ARCH}" = "x86_64-musl" ]; then
-            # For musl cross-builds we need BOTH the glibc repo (host
-            # side) AND the musl repo (target side).
-            cat > /etc/xbps.d/00-repository-main.conf <<'EOF'
-          repository=https://repo-fastly.voidlinux.org/current/
-          repository=https://repo-fastly.voidlinux.org/current/musl/
-          EOF
-          else
-            cat > /etc/xbps.d/00-repository-main.conf <<'EOF'
+          cat > /etc/xbps.d/00-repository-main.conf <<'EOF'
           repository=https://repo-fastly.voidlinux.org/current/
           EOF
-          fi
 
-          echo "=== /etc/xbps.d/00-repository-main.conf ==="
+          echo "=== /etc/xbps.d/00-repository-main.conf (HOST, always glibc) ==="
           cat /etc/xbps.d/00-repository-main.conf
 
-          # Now xbps-install will read the Fastly mirror. Two-step update:
-          # upgrade xbps itself first (so it can handle current repo
-          # signatures), then the rest of the system, then runtime deps.
+          # Two-step update: upgrade xbps itself first (so it can handle
+          # current repo signatures), then the rest of the system, then
+          # the runtime deps we need for xbps-src + signing.
           xbps-install -Syu xbps
           xbps-install -Suyd
           xbps-install -y \
@@ -209,16 +207,65 @@ jobs:
           cp -r "${WS}/repo/void-packages/srcpkgs/ungoogled-chromium"    srcpkgs/
           cp -r "${WS}/repo/void-packages/srcpkgs/ungoogled-chromium-qt6" srcpkgs/
 
-          # Append XBPS_DISTFILES_MIRROR to void-packages/etc/conf so
-          # xbps-src's fetch step downloads distfiles from Fastly too.
-          # (Binary repos are already configured via /etc/xbps.d/ in the
-          # previous step.)
+          # ============================================================
+          # Rewrite xbps-src's repo fragments to point at Fastly CDN.
+          # ============================================================
+          # void-packages ships etc/xbps.d/repos-remote*.conf that point
+          # at repo-default.voidlinux.org, which sometimes resolves to
+          # mirrors with expired TLS certs (alpha.de.repo.voidlinux.org).
+          # xbps-src copies these files into the build chroot and selects
+          # the right one based on XBPS_ARCH (repos-remote.conf for glibc,
+          # repos-remote-musl.conf for musl, repos-remote-x86_64-multilib
+          # for multilib, etc.).
+          #
+          # We rewrite ALL of them to point at Fastly so xbps-src's
+          # internal xbps-install / xbps-query calls work regardless of
+          # which arch xbps-src is targeting.
+          for f in etc/xbps.d/repos-remote*.conf; do
+            case "$f" in
+              *musl*)
+                # musl repo lives under /current/musl/
+                cat > "$f" <<'EOF'
+          repository=https://repo-fastly.voidlinux.org/current/musl/bootstrap
+          repository=https://repo-fastly.voidlinux.org/current/musl
+          repository=https://repo-fastly.voidlinux.org/current/musl/nonfree
+          repository=https://repo-fastly.voidlinux.org/current/musl/debug
+          EOF
+                ;;
+              *multilib*)
+                # multilib repo lives under /current/multilib/
+                cat > "$f" <<'EOF'
+          repository=https://repo-fastly.voidlinux.org/current/multilib/bootstrap
+          repository=https://repo-fastly.voidlinux.org/current/multilib
+          repository=https://repo-fastly.voidlinux.org/current/multilib/nonfree
+          EOF
+                ;;
+              *)
+                # Default: glibc repo at /current/
+                cat > "$f" <<'EOF'
+          repository=https://repo-fastly.voidlinux.org/current/bootstrap
+          repository=https://repo-fastly.voidlinux.org/current
+          repository=https://repo-fastly.voidlinux.org/current/nonfree
+          repository=https://repo-fastly.voidlinux.org/current/debug
+          EOF
+                ;;
+            esac
+          done
+
+          # Also append XBPS_DISTFILES_MIRROR to etc/conf so xbps-src's
+          # fetch step downloads distfiles from Fastly too.
           cat >> etc/conf <<EOF
 
           # Added by create-release.yml — force Fastly CDN mirror for distfiles
           XBPS_DISTFILES_MIRROR=https://repo-fastly.voidlinux.org/current
           EOF
 
+          echo "=== void-packages/etc/xbps.d/repos-remote.conf (glibc) ==="
+          cat etc/xbps.d/repos-remote.conf
+          echo
+          echo "=== void-packages/etc/xbps.d/repos-remote-musl.conf ==="
+          cat etc/xbps.d/repos-remote-musl.conf 2>/dev/null || echo "(not present)"
+          echo
           echo "=== void-packages/etc/conf (tail) ==="
           tail -5 etc/conf
           echo
