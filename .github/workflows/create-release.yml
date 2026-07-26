@@ -105,20 +105,16 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          # XBPS_ARCH is what xbps-src will pass to its target. -A is the
-          # shortcut xbps-src exposes for setting it.
+          # -A is the xbps-src flag that sets the target arch. xbps-src
+          # internally sets XBPS_TARGET_ARCH only inside its build chroot.
           #   x86_64       = native glibc build (container is glibc/amd64)
-          #   x86_64-musl  = cross build: glibc host compiles musl target via
-          #                  the musl bootstrap tarball from
-          #                  repo-fastly.voidlinux.org/current/musl
+          #   x86_64-musl  = cross build: glibc host compiles musl target
+          #                  via the musl bootstrap tarball from
+          #                  repo-fastly.voidlinux.org/current/musl/
           - arch: x86_64
             description: "glibc"
-            # glibc repo lives at the root of /current/
-            repo: "https://repo-fastly.voidlinux.org/current/"
           - arch: x86_64-musl
             description: "musl"
-            # musl repo lives under /current/musl/
-            repo: "https://repo-fastly.voidlinux.org/current/musl/"
     # ubuntu-22.04 is what repo-neko uses and is known to work with
     # `container: image: ghcr.io/void-linux/void-mklive:...` + --privileged.
     runs-on: ubuntu-22.04
@@ -127,46 +123,53 @@ jobs:
       image: ghcr.io/void-linux/void-mklive:20250116R1
       options: --privileged
     env:
-      XBPS_TARGET_ARCH: ${{ matrix.arch }}
+      # CRITICAL: do NOT use XBPS_TARGET_ARCH here!
+      # libxbps reads XBPS_TARGET_ARCH (lib/initend.c:112) and uses it as the
+      # target arch for EVERY xbps-* command — including xbps-install on the
+      # HOST. If we set XBPS_TARGET_ARCH=x86_64-musl here, xbps-install on
+      # the glibc host container goes looking for x86_64-musl-repodata in
+      # the glibc repo (/current/) and fails with HTTP 404.
+      #
+      # Instead we use our own TARGET_ARCH variable for naming purposes,
+      # and pass the target arch to xbps-src via -A ${TARGET_ARCH} (which
+      # sets XBPS_TARGET_ARCH only inside the build chroot).
+      TARGET_ARCH: ${{ matrix.arch }}
       PKG_VER: ${{ needs.Fetch.outputs.ver }}
       PKG_REV: ${{ needs.Fetch.outputs.rev }}
-      # The default mirror baked into the image (alpha.de.repo.voidlinux.org)
-      # has an expired / mismatched TLS cert and the host no longer exists.
-      # Force the Fastly CDN mirror for every xbps-install call below.
-      XBPS_REPO: ${{ matrix.repo }}
     steps:
       - name: Force Fastly CDN mirror and install tools
         # ============================================================
         # CRITICAL — read this before editing.
         # ============================================================
         # The container (ghcr.io/void-linux/void-mklive) is ALWAYS glibc
-        # on amd64, even when we cross-build for musl. So the HOST's
-        # /etc/xbps.d/ must ONLY list glibc repos — listing the musl repo
-        # here caused xbps-install to download musl .xbps packages
-        # (musl-1.2.5_3, xbps-0.60.7_1.x86_64-musl.xbps, ...) and install
-        # them on top of the glibc rootfs, which produced:
+        # on amd64. We confirmed this from the image's Dockerfile, which
+        # builds with ${MIRROR}/current (glibc), not /current/musl.
+        #
+        # The HOST's /etc/xbps.d/ must therefore ONLY list the glibc repo.
+        # Listing the musl repo here would make xbps-install download musl
+        # .xbps packages and install them on top of the glibc rootfs,
+        # which produces:
         #   Error relocating /lib/libarchive.so.13: __open_2: symbol not found
-        #   Error relocating /lib/libarchive.so.13: __snprintf_chk: symbol not found
         #   ... (and exit code 127)
         #
-        # The musl repo IS still needed, but only INSIDE the xbps-src
+        # The musl repo is still needed, but only INSIDE the xbps-src
         # build chroot — xbps-src copies void-packages/etc/xbps.d/
         # into the chroot and selects the right repos-remote-*.conf
-        # based on XBPS_ARCH. We rewrite those files in a later step
-        # to also point at Fastly.
-        env:
-          XBPS_REPO: ${{ matrix.repo }}
+        # based on XBPS_ARCH (which xbps-src sets from -A). We rewrite
+        # those files in the next step to also point at Fastly.
         run: |
-          echo "Target arch:    ${XBPS_TARGET_ARCH}"
-          echo "Using XBPS repo: ${XBPS_REPO}  (used only for the musl target inside xbps-src)"
+          echo "Target arch:    ${TARGET_ARCH}  (only used by xbps-src -A)"
+          echo "Host arch:      $(xbps-uhelper arch)  (always glibc on this image)"
 
-          # The HOST container is glibc, regardless of XBPS_TARGET_ARCH.
           # Wipe any xbps.d fragments the image might ship and write a
-          # single one pointing at the Fastly glibc repo.
+          # single one pointing at the Fastly glibc repo. NOTE: no trailing
+          # slash — xbps-install appends '/<arch>-repodata' itself, and a
+          # double slash in the URL looks ugly in logs even though most
+          # servers normalize it.
           rm -f /etc/xbps.d/*.conf
           mkdir -p /etc/xbps.d
           cat > /etc/xbps.d/00-repository-main.conf <<'EOF'
-          repository=https://repo-fastly.voidlinux.org/current/
+          repository=https://repo-fastly.voidlinux.org/current
           EOF
 
           echo "=== /etc/xbps.d/00-repository-main.conf (HOST, always glibc) ==="
@@ -282,9 +285,9 @@ jobs:
           # -A ${{ matrix.arch }} tells xbps-src the target arch. For musl,
           # xbps-src will automatically download the musl bootstrap tarball
           # from the musl/ subrepo.
-          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${XBPS_TARGET_ARCH}"' binary-bootstrap'
-          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${XBPS_TARGET_ARCH}"' fetch ungoogled-chromium'
-          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${XBPS_TARGET_ARCH}"' -C pkg ungoogled-chromium'
+          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${TARGET_ARCH}"' binary-bootstrap'
+          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${TARGET_ARCH}"' fetch ungoogled-chromium'
+          su - builder -c 'cd /tmp/void-packages && ./xbps-src -A '"${TARGET_ARCH}"' -C pkg ungoogled-chromium'
 
           echo "=== Produced packages ==="
           ls -la /tmp/void-packages/hostdir/binpkgs/ungoogled-chromium* || true
@@ -305,22 +308,22 @@ jobs:
 
           cd /tmp/void-packages/hostdir/binpkgs
           # xbps-rindex names the repodata file after the target arch.
-          rm -f "${XBPS_TARGET_ARCH}-repodata"
+          rm -f "${TARGET_ARCH}-repodata"
 
-          xbps-rindex -a "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
-          xbps-rindex -a "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
+          xbps-rindex -a "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${TARGET_ARCH}.xbps"
+          xbps-rindex -a "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${TARGET_ARCH}.xbps"
 
           xbps-rindex --sign --signedby "Shiraori archive" \
             --privkey /tmp/shiraori.pem "$PWD"
 
           xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
-            "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
+            "ungoogled-chromium-${PKG_VER}_${PKG_REV}.${TARGET_ARCH}.xbps"
           xbps-rindex --sign-pkg --privkey /tmp/shiraori.pem \
-            "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${XBPS_TARGET_ARCH}.xbps"
+            "ungoogled-chromium-qt6-${PKG_VER}_${PKG_REV}.${TARGET_ARCH}.xbps"
 
           rm -f /tmp/shiraori.pem
           echo "=== Signed packages ==="
-          ls -la ungoogled-chromium* "${XBPS_TARGET_ARCH}-repodata" 2>/dev/null || true
+          ls -la ungoogled-chromium* "${TARGET_ARCH}-repodata" 2>/dev/null || true
 
       - name: Upload binpkgs as workflow artifact
         uses: actions/upload-artifact@v4
