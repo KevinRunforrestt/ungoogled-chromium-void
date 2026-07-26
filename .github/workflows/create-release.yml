@@ -150,7 +150,11 @@ jobs:
             -e XBPS_ARCH="${ARCH}" \
             -e XBPS_PASSPHRASE="${XBPS_PASSPHRASE}" \
             "${IMAGE}" \
-            bash -eux -c '
+            /bin/sh -eux -c '
+              # NB: we use /bin/sh (not bash) because the 2021 base images,
+              # especially the musl one, do NOT ship bash in $PATH. We install
+              # bash below as part of the runtime deps; xbps-src requires it.
+              #
               # 1. Update xbps itself first (the 2021 image ships an old xbps
               #    that may not parse current repo signatures). Then update
               #    the whole base system. Two-step to avoid the classic
@@ -208,7 +212,7 @@ jobs:
             -e PKG_REV="${PKG_REV}" \
             -e ARCH="${ARCH}" \
             "${IMAGE}" \
-            bash -eu -c '
+            /bin/sh -eu -c '
               printf "%s\n" "${SHIRAORI_PEM}" > /tmp/shiraori.pem
               chmod 600 /tmp/shiraori.pem
 
